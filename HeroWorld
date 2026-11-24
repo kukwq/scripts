@@ -1,0 +1,2004 @@
+--[[
+    AUTO FARM HUB v5.4 (Luau / Executor)
+
+    Correções na v5.4:
+    - Quando o alvo da quest ainda não está spawnado no momento em que a quest é adotada,
+      resolveLivingName() não encontra o nome exato em Living. Agora, enquanto aguarda
+      respawn com quest ativa, o loop re-resolve State.AdoptedFor até encontrar o nome
+      real do NPC assim que ele spawnar.
+]]
+
+local genv = (getgenv and getgenv()) or _G
+if genv.__AutoFarmHub_Cleanup then
+    pcall(genv.__AutoFarmHub_Cleanup)
+end
+
+local Players             = game:GetService("Players")
+local RunService          = game:GetService("RunService")
+local TweenService        = game:GetService("TweenService")
+local UserInputService    = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local GuiService          = game:GetService("GuiService")
+local HttpService         = game:GetService("HttpService")
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local LP = Players.LocalPlayer
+while not LP do
+    task.wait()
+    LP = Players.LocalPlayer
+end
+
+local function waitFor(parent, name)
+    local inst = parent:WaitForChild(name, 10)
+    if not inst then
+        error(("[AutoFarmHub] '%s' não encontrado em %s (jogo/build diferente?)"):format(name, parent:GetFullName()), 0)
+    end
+    return inst
+end
+
+local LIVING        = waitFor(workspace, "Living")
+local NPCS          = waitFor(workspace, "NPCs")
+local PKG           = waitFor(ReplicatedStorage, "Package")
+local EventsFolder  = waitFor(PKG, "Events")
+local CombatEvent   = waitFor(EventsFolder, "Combat")
+local GetQuestEvent = waitFor(EventsFolder, "GetQuest")
+
+local HUD = {
+    Quest       = {"HUD", "Frames", "Quest"},
+    QuestDesc   = {"HUD", "Frames", "Quest", "Frame", "Description"},
+    Chat        = {"HUD", "Frames", "Chat"},
+    ChatOption1 = {"HUD", "Frames", "Chat", "Options", "Option1"},
+    ChatOption2 = {"HUD", "Frames", "Chat", "Options", "Option2"},
+    StartPlay   = {"Start", "Buttons", "Play"},
+}
+
+local QUEST_NPC_MAP = {
+    ["Salad"] = "Thugs",
+    ["Smile"] = "Criminals",
+}
+
+local Keys = {
+    ToggleUI   = Enum.KeyCode.RightShift,
+    ToggleFarm = Enum.KeyCode.F6,
+}
+
+local Config = {
+    NPCName       = nil,
+    Mode          = "Atrás",
+    Distance      = 4,
+    TravelSpeed   = 200,
+    SnapRadius    = 6,
+    Noclip        = false,
+    RespawnWait   = 8,
+    TargetTimeout = 0,
+
+    AutoAttack        = false,
+    AttackSpeed       = 0.12,
+    AttackType        = 1,
+    AttackOffset      = 1.5,
+    AttackMaxDistance = 12,
+    UseClickSim       = true,
+    UseRemote         = false,
+
+    AutoDodge         = false,
+    DodgeDistance     = 22,
+    DodgeSpeedMult    = 1.8,
+    DodgeHold         = 0.8,
+
+    AutoQuest         = false,
+    AutoQuestCooldown = 1.0,
+    QuestUseDialogue  = true,
+    PreferRemote      = true,
+    QuestTouchPart    = "",
+    LearnQuestArg     = true,
+    QuestMap          = {},
+    QuestStand        = {},
+
+    AutoRaid          = false,
+    RaidName          = "Backstreet Raid",
+    RaidDifficulty    = "Normal",
+}
+
+local POLL             = 0.05
+local CHECK            = 0.1
+local DIALOGUE_TIMEOUT = 12
+local NORMAL_PLACE_ID  = 4934471106
+
+local RAID_LIST = {
+    "Backstreet Raid",
+    "Survival Arena (Hero)",
+    "Survival Arena (Villain)",
+    "Revamp Bossfight",
+    "Salad (100%) Bossfight",
+    "Bomb (100%) Bossfight",
+    "Inferno Raid",
+    "Monster Lizard Bossfight",
+    "Mimic Bossfight",
+    "Everything is mine raid",
+}
+
+local RAID_DIFFICULTIES = {"Easy", "Normal", "Hard", "Impossible"}
+
+local VALID_MODES = {["Cima"] = true, ["Baixo"] = true, ["Atrás"] = true}
+local CONFIG_FILE = "AutoFarmHub_v5.json"
+local SAVE_KEYS = {
+    "Mode", "Distance", "TravelSpeed", "SnapRadius", "Noclip", "RespawnWait", "TargetTimeout",
+    "AutoAttack", "AttackSpeed", "AttackType", "AttackOffset", "AttackMaxDistance", "UseClickSim", "UseRemote",
+    "AutoDodge", "DodgeDistance", "DodgeSpeedMult", "DodgeHold",
+    "AutoQuest", "AutoQuestCooldown", "QuestUseDialogue", "PreferRemote", "QuestTouchPart", "LearnQuestArg",
+    "AutoRaid", "RaidName", "RaidDifficulty",
+}
+
+local Hooks = {
+    Status      = function() end,
+    Notify      = function(msg) print("[AutoFarmHub] " .. tostring(msg)) end,
+    FarmToggle  = function() end,
+    QuestToggle = function() end,
+    NPCName     = function() end,
+}
+
+local function loadConfig()
+    if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" then return false end
+    local ok, data = pcall(function()
+        if not isfile(CONFIG_FILE) then return nil end
+        return HttpService:JSONDecode(readfile(CONFIG_FILE))
+    end)
+    if not ok or type(data) ~= "table" then return false end
+
+    for _, k in ipairs(SAVE_KEYS) do
+        if data[k] ~= nil and type(data[k]) == type(Config[k]) then
+            Config[k] = data[k]
+        end
+    end
+    if type(data.NPCName) == "string" and data.NPCName ~= "" then
+        Config.NPCName = data.NPCName
+    end
+    if type(data.QuestMap) == "table" then
+        for k, v in pairs(data.QuestMap) do
+            if type(k) == "string" and type(v) == "string" then
+                Config.QuestMap[k] = v
+            end
+        end
+    end
+    if type(data.QuestStand) == "table" then
+        for k, v in pairs(data.QuestStand) do
+            if type(k) == "string" and type(v) == "table"
+                and type(v[1]) == "number" and type(v[2]) == "number" and type(v[3]) == "number"
+                and v[1] == v[1] and v[2] == v[2] and v[3] == v[3] then
+                Config.QuestStand[k] = {v[1], v[2], v[3]}
+            end
+        end
+    end
+    if not VALID_MODES[Config.Mode] then
+        Config.Mode = "Atrás"
+    end
+    return true
+end
+
+local function saveConfig(silent)
+    if typeof(writefile) ~= "function" then
+        if not silent then Hooks.Notify("Este executor não expõe writefile.") end
+        return false
+    end
+    local data = {
+        NPCName    = Config.NPCName,
+        QuestMap   = Config.QuestMap,
+        QuestStand = Config.QuestStand,
+    }
+    for _, k in ipairs(SAVE_KEYS) do
+        data[k] = Config[k]
+    end
+    local ok, err = pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+    end)
+    if not silent then
+        Hooks.Notify(ok and ("Config salva em " .. CONFIG_FILE) or ("Falha ao salvar: " .. tostring(err)))
+    elseif not ok then
+        warn("[AutoFarmHub] falha no autosave: " .. tostring(err))
+    end
+    return ok
+end
+
+local dirtyAt = nil
+local function markDirty()
+    dirtyAt = os.clock()
+end
+
+loadConfig()
+
+local Runtime = {
+    Alive     = true,
+    Conns     = {},
+    Gui       = nil,
+    MainFrame = nil,
+    ToggleUI  = function() end,
+}
+
+local function keep(conn)
+    table.insert(Runtime.Conns, conn)
+    return conn
+end
+
+local function guarded(name, fn)
+    local lastErr
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok and err ~= lastErr then
+            lastErr = err
+            warn(("[AutoFarmHub] erro em %s: %s"):format(name, tostring(err)))
+        end
+    end
+end
+
+local function spawnLoop(name, fn, interval)
+    local safe = guarded(name, fn)
+    task.spawn(function()
+        while Runtime.Alive do
+            safe()
+            local w = type(interval) == "function" and interval() or interval
+            task.wait(w)
+        end
+    end)
+end
+
+local State = {
+    Enabled     = false,
+    Target      = nil,
+    TargetSince = 0,
+    EmptySince  = nil,
+    SavedCFrame = nil,
+    QuestBusy   = false,
+    NeedNoclip  = false,
+    AdoptedFor  = nil,
+    QuestFails  = 0,
+    Giver       = nil,
+    WasActive   = nil,
+}
+
+local Skipped       = setmetatable({}, {__mode = "k"})
+local noclipTouched = {}
+local clearDodgeWatch
+
+local function cleanup()
+    if dirtyAt then
+        dirtyAt = nil
+        pcall(saveConfig, true)
+    end
+    genv.__AutoFarmHub_Capture = nil
+    Runtime.Alive = false
+    State.Enabled = false
+    State.NeedNoclip = false
+    for p in pairs(noclipTouched) do
+        if p.Parent then p.CanCollide = true end
+    end
+    table.clear(noclipTouched)
+    for _, c in ipairs(Runtime.Conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Runtime.Conns)
+    if clearDodgeWatch then pcall(clearDodgeWatch) end
+    if Runtime.Gui then
+        pcall(function() Runtime.Gui:Destroy() end)
+    end
+    if genv.__AutoFarmHub_Cleanup == cleanup then
+        genv.__AutoFarmHub_Cleanup = nil
+    end
+end
+genv.__AutoFarmHub_Cleanup = cleanup
+
+local function findPath(root, path)
+    local cur = root
+    for _, n in ipairs(path) do
+        cur = cur and cur:FindFirstChild(n)
+        if not cur then return nil end
+    end
+    return cur
+end
+
+local function hudGet(path)
+    local pg = LP:FindFirstChild("PlayerGui")
+    return pg and findPath(pg, path) or nil
+end
+
+local hasActiveQuest
+
+local function getCharacterParts()
+    local char = LP.Character
+    if not char then return nil end
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root or hum.Health <= 0 then return nil end
+    return char, hum, root
+end
+
+local function isRaidFarmActive()
+    return Config.AutoRaid and game.PlaceId ~= NORMAL_PLACE_ID
+end
+
+local function makeEntry(m)
+    if not m:IsA("Model") or Players:GetPlayerFromCharacter(m) then return nil end
+    if not isRaidFarmActive() and m.Name ~= Config.NPCName then return nil end
+    local hum = m:FindFirstChildOfClass("Humanoid")
+    local hrp = m:FindFirstChild("HumanoidRootPart")
+    if hum and hrp and hum.Health > 0 and hum:GetState() ~= Enum.HumanoidStateType.Dead then
+        return {model = m, hum = hum, hrp = hrp}
+    end
+    return nil
+end
+
+local function getGroupNPCs()
+    local list = {}
+    if not isRaidFarmActive() and not Config.NPCName then return list end
+    for _, m in ipairs(LIVING:GetChildren()) do
+        local e = makeEntry(m)
+        if e then table.insert(list, e) end
+    end
+    return list
+end
+
+local function listNPCNames()
+    local counts, names = {}, {}
+    for _, m in ipairs(LIVING:GetChildren()) do
+        if m:IsA("Model") and not Players:GetPlayerFromCharacter(m) then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 and m:FindFirstChild("HumanoidRootPart") then
+                if not counts[m.Name] then
+                    counts[m.Name] = 0
+                    table.insert(names, m.Name)
+                end
+                counts[m.Name] += 1
+            end
+        end
+    end
+    table.sort(names)
+    local out = {}
+    for _, n in ipairs(names) do
+        table.insert(out, {name = n, count = counts[n]})
+    end
+    return out
+end
+
+local function resolveLivingName(parsed)
+    if not parsed or parsed == "" then return nil end
+    local names = listNPCNames()
+    local lower = parsed:lower()
+    local function try(pred)
+        for _, n in ipairs(names) do
+            if pred(n.name:lower()) then return n.name end
+        end
+        return nil
+    end
+    return try(function(n) return n == lower end)
+        or try(function(n) return n .. "s" == lower or n .. "es" == lower or lower .. "s" == n end)
+        or try(function(n) return n:find(lower, 1, true) ~= nil or lower:find(n, 1, true) ~= nil end)
+        or parsed
+end
+
+local function isTargetAlive(t)
+    return t ~= nil
+        and t.model ~= nil and t.model.Parent ~= nil
+        and t.hum ~= nil and t.hum.Parent ~= nil
+        and t.hrp ~= nil and t.hrp.Parent ~= nil
+        and t.hum.Health > 0
+        and t.hum:GetState() ~= Enum.HumanoidStateType.Dead
+end
+
+local function pickNextTarget()
+    local _, _, root = getCharacterParts()
+    if not root then return nil end
+    local best, bestDist = nil, math.huge
+    local now = os.clock()
+    for _, e in ipairs(getGroupNPCs()) do
+        local exp = Skipped[e.model]
+        if not exp or exp < now then
+            local d = (e.hrp.Position - root.Position).Magnitude
+            if d < bestDist then
+                best, bestDist = e, d
+            end
+        end
+    end
+    return best
+end
+
+local function computeTargetCFrame(npcHRP, mode, dist)
+    local npcCF  = npcHRP.CFrame
+    local npcPos = npcCF.Position
+    local _, yaw = npcCF:ToOrientation()
+    local yawCF  = CFrame.Angles(0, yaw, 0)
+    if mode == "Cima" then
+        return CFrame.new(npcPos + Vector3.new(0, dist, 0)) * yawCF * CFrame.Angles(-math.pi / 2, 0, 0)
+    elseif mode == "Baixo" then
+        return CFrame.new(npcPos + Vector3.new(0, -dist, 0)) * yawCF * CFrame.Angles(math.pi / 2, 0, 0)
+    end
+    local behind = npcCF * CFrame.new(0, 0, dist)
+    return CFrame.lookAt(behind.Position, npcPos + Vector3.new(0, 1.5, 0))
+end
+
+local function stepToward(root, goal, dt, speed, snap)
+    local cur     = root.Position
+    local delta   = goal.Position - cur
+    local dist    = delta.Magnitude
+    local maxStep = (speed or Config.TravelSpeed) * dt
+    local snapRad = snap or Config.SnapRadius
+    if dist <= snapRad or dist <= maxStep then
+        root.CFrame = goal
+    else
+        root.CFrame = CFrame.new(cur + delta.Unit * maxStep) * (goal - goal.Position)
+    end
+    root.AssemblyLinearVelocity  = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local travelToken = 0
+local function cancelTravel()
+    travelToken += 1
+end
+
+local function travelTo(goalCF)
+    travelToken += 1
+    local my = travelToken
+    local _, _, root0 = getCharacterParts()
+    if not root0 then return false end
+
+    local timeout = (goalCF.Position - root0.Position).Magnitude / math.max(Config.TravelSpeed, 1) + 5
+    local t0      = os.clock()
+    local arrived = false
+    State.NeedNoclip = true
+
+    while Runtime.Alive and travelToken == my and os.clock() - t0 < timeout do
+        local dt = math.min(RunService.Heartbeat:Wait(), 0.1)
+        local _, _, root = getCharacterParts()
+        if not root then break end
+        stepToward(root, goalCF, dt)
+        if (goalCF.Position - root.Position).Magnitude < 0.5 then
+            arrived = true
+            break
+        end
+    end
+
+    if travelToken == my then
+        State.NeedNoclip = false
+    end
+    return arrived
+end
+
+keep(RunService.Stepped:Connect(guarded("noclip", function()
+    local char = LP.Character
+    if State.NeedNoclip and char then
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") and p.CanCollide then
+                noclipTouched[p] = true
+                p.CanCollide = false
+            end
+        end
+    elseif next(noclipTouched) ~= nil then
+        for p in pairs(noclipTouched) do
+            if p.Parent then p.CanCollide = true end
+        end
+        table.clear(noclipTouched)
+    end
+end)))
+
+local function stopFarm(reason, restore)
+    State.Enabled    = false
+    State.Target     = nil
+    State.EmptySince = nil
+
+    local saved = State.SavedCFrame
+    State.SavedCFrame = nil
+
+    if restore and saved and getCharacterParts() then
+        task.spawn(guarded("restore", function()
+            Hooks.Status("Voltando à posição original...")
+            travelTo(saved)
+            if not State.Enabled and not State.QuestBusy then
+                Hooks.Status("Parado")
+            end
+        end))
+    else
+        State.NeedNoclip = false
+    end
+
+    Hooks.FarmToggle(false)
+    Hooks.Status("Parado")
+    if reason == "no-npcs" then
+        Hooks.Notify("Sem NPCs do grupo; voltando à posição original.")
+    end
+end
+
+local function startFarm(originCF)
+    if State.Enabled then return true end
+    if not isRaidFarmActive() and not Config.NPCName then
+        Hooks.Notify("Selecione um NPC primeiro.")
+        Hooks.FarmToggle(false)
+        return false
+    end
+    local _, _, root = getCharacterParts()
+    if not root then
+        Hooks.Notify("Personagem indisponível.")
+        Hooks.FarmToggle(false)
+        return false
+    end
+    cancelTravel()
+    State.SavedCFrame = originCF or root.CFrame
+    State.Target      = nil
+    State.EmptySince  = nil
+    State.Enabled     = true
+    Hooks.FarmToggle(true)
+    return true
+end
+
+local IGNORED_DODGE_ANIMS = {
+    ["4964608914"] = true, -- corrida
+    ["4763342245"] = true, -- dash
+    ["5177914013"] = true, -- hit 1
+    ["5177916220"] = true, -- hit 2
+    ["5177921414"] = true, -- hit 3
+    ["5177923520"] = true, -- hit 4
+    ["5177931636"] = true, -- hit 5
+    ["5177952518"] = true, -- apanhando 1
+    ["5177954403"] = true, -- apanhando 2
+    ["5177956041"] = true, -- apanhando 3
+    ["5177967696"] = true, -- apanhando 4
+    ["5177971406"] = true, -- apanhando 5
+}
+
+local Dodge = {
+    TargetModel  = nil,
+    ActiveTracks = {},
+    WasDodging   = false,
+    Returning    = false,
+    Conns        = {},
+}
+
+clearDodgeWatch = function()
+    for _, c in ipairs(Dodge.Conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Dodge.Conns)
+    table.clear(Dodge.ActiveTracks)
+    Dodge.TargetModel = nil
+    Dodge.WasDodging   = false
+    Dodge.Returning   = false
+end
+
+local function watchDodgeTarget(entry)
+    local model = entry and entry.model or nil
+    if Dodge.TargetModel == model then return end
+    clearDodgeWatch()
+    if not model or not entry.hum then return end
+
+    Dodge.TargetModel = model
+    local anim = entry.hum:FindFirstChildOfClass("Animator")
+    if not anim then return end
+
+    table.insert(Dodge.Conns, anim.AnimationPlayed:Connect(function(track)
+        local rawId  = track.Animation and track.Animation.AnimationId or ""
+        local animId = rawId:match("%d+")
+        if not animId or IGNORED_DODGE_ANIMS[animId] then return end
+
+        Dodge.ActiveTracks[track] = true
+        Dodge.Returning = false
+
+        local conn
+        conn = track.Stopped:Connect(function()
+            conn:Disconnect()
+            Dodge.ActiveTracks[track] = nil
+            if next(Dodge.ActiveTracks) == nil then
+                Dodge.Returning = true
+            end
+        end)
+        table.insert(Dodge.Conns, conn)
+    end))
+end
+
+keep(RunService.Heartbeat:Connect(guarded("farm", function(dt)
+    if not State.Enabled or State.QuestBusy then return end
+    dt = math.min(dt, 0.1)
+
+    local _, _, root = getCharacterParts()
+    if not root then
+        State.Target = nil
+        State.NeedNoclip = false
+        Hooks.Status("Aguardando personagem...")
+        return
+    end
+
+    local t = State.Target
+    if not isTargetAlive(t) then
+        -- Se o alvo ainda não estava spawnado quando a quest foi adotada, re-resolve o nome em Living
+        if Config.AutoQuest and State.AdoptedFor and State.AdoptedFor ~= "(desconhecido)" then
+            local resolved = resolveLivingName(State.AdoptedFor)
+            if resolved and resolved ~= Config.NPCName then
+                Config.NPCName = resolved
+                Hooks.NPCName(resolved)
+                markDirty()
+            end
+        end
+
+        t = pickNextTarget()
+        if t then
+            State.Target      = t
+            State.TargetSince = os.clock()
+            State.EmptySince  = nil
+        else
+            State.Target = nil
+            State.NeedNoclip = false
+            local now = os.clock()
+            State.EmptySince = State.EmptySince or now
+            if isRaidFarmActive() then
+                Hooks.Status("Aguardando onda da raid...")
+            elseif Config.AutoQuest and hasActiveQuest() then
+                Hooks.Status("Aguardando respawn (quest ativa)...")
+            elseif now - State.EmptySince >= Config.RespawnWait then
+                stopFarm("no-npcs", true)
+            else
+                Hooks.Status("Aguardando respawn...")
+            end
+            return
+        end
+    end
+
+    if Config.TargetTimeout > 0 and os.clock() - State.TargetSince > Config.TargetTimeout then
+        Skipped[t.model] = os.clock() + 20
+        State.Target = nil
+        Hooks.Notify("Alvo travado, pulando: " .. t.model.Name)
+        return
+    end
+
+    local dodging = false
+    if Config.AutoDodge then
+        watchDodgeTarget(t)
+        for track in pairs(Dodge.ActiveTracks) do
+            if not track.IsPlaying then
+                Dodge.ActiveTracks[track] = nil
+            end
+        end
+        dodging = next(Dodge.ActiveTracks) ~= nil
+        if Dodge.WasDodging and not dodging then
+            Dodge.Returning = true
+        end
+        Dodge.WasDodging = dodging
+    elseif Dodge.TargetModel ~= nil then
+        clearDodgeWatch()
+    end
+
+    local effectiveDist = Config.Distance + (dodging and Config.DodgeDistance or 0)
+    local goal = computeTargetCFrame(t.hrp, Config.Mode, effectiveDist)
+    local dist = (goal.Position - root.Position).Magnitude
+    State.NeedNoclip = Config.Noclip or Config.Mode == "Baixo" or dist > 15 or dodging or Dodge.Returning
+
+    if dodging or Dodge.Returning then
+        local dodgeSpeed = Config.TravelSpeed * Config.DodgeSpeedMult
+        stepToward(root, goal, dt, dodgeSpeed, 0.5)
+        if Dodge.Returning and dist <= 1.0 then
+            Dodge.Returning = false
+        end
+    else
+        stepToward(root, goal, dt)
+    end
+
+    Hooks.Status((dodging and "Desviando: " or "Farmando: ") .. t.model.Name)
+end)))
+
+keep(LP.CharacterAdded:Connect(function()
+    State.Target = nil
+    State.NeedNoclip = false
+    table.clear(noclipTouched)
+end))
+
+local function sendClickAt(x, y)
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.02)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+end
+
+local function isHubInteracting()
+    if UserInputService:GetFocusedTextBox() then return true end
+    local main = Runtime.MainFrame
+    if not main or not main.Visible then return false end
+    local pos  = UserInputService:GetMouseLocation()
+    local inset = GuiService:GetGuiInset()
+    local mx, my = pos.X - inset.X, pos.Y - inset.Y
+    local ap, as = main.AbsolutePosition, main.AbsoluteSize
+    return mx >= ap.X and mx <= ap.X + as.X and my >= ap.Y and my <= ap.Y + as.Y
+end
+
+local function simulateClick()
+    if isHubInteracting() then return end
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+    local vp = camera.ViewportSize
+    sendClickAt(math.floor(vp.X / 2), math.floor(vp.Y / 2))
+end
+
+local function callRemote(remote, ...)
+    if remote:IsA("RemoteFunction") then
+        return remote:InvokeServer(...)
+    end
+    remote:FireServer(...)
+end
+
+local function callRemoteTimeout(remote, timeout, ...)
+    local args = table.pack(...)
+    local done, ok, err, res = false, false, nil, nil
+    task.spawn(function()
+        ok, err = pcall(function()
+            res = callRemote(remote, table.unpack(args, 1, args.n))
+        end)
+        done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < timeout do
+        if hasActiveQuest() then return true, "Yes" end
+        task.wait(POLL)
+    end
+    if not done then return false, "timeout" end
+    if hasActiveQuest() then return true, res end
+    return ok, res or err
+end
+
+local function buildAttackCFrame(entry)
+    local _, _, root = getCharacterParts()
+    if not root or not entry or not entry.hrp then return nil end
+    local npcPos = entry.hrp.Position
+    local dir    = npcPos - root.Position
+    if dir.Magnitude < 0.01 then dir = Vector3.new(0, 0, -1) end
+    local unitDir = dir.Unit
+    local hitPos  = npcPos + unitDir * Config.AttackOffset
+    return CFrame.lookAt(hitPos, hitPos + unitDir)
+end
+
+spawnLoop("attack", function()
+    if not State.Enabled or not Config.AutoAttack or State.QuestBusy then return end
+    local t = State.Target
+    if not isTargetAlive(t) then return end
+    local _, _, root = getCharacterParts()
+    if not root then return end
+    if (t.hrp.Position - root.Position).Magnitude > Config.AttackMaxDistance then return end
+
+    if Config.UseRemote then
+        local cf = buildAttackCFrame(t)
+        if cf then
+            if CombatEvent:IsA("RemoteEvent") then
+                CombatEvent:FireServer(Config.AttackType, cf)
+            else
+                task.spawn(function() pcall(callRemote, CombatEvent, Config.AttackType, cf) end)
+            end
+        end
+    end
+    if Config.UseClickSim then simulateClick() end
+end, function() return math.max(Config.AttackSpeed, 0.05) end)
+
+local function parseQuestDescription(raw)
+    if type(raw) ~= "string" then return nil end
+    local s = raw:gsub("<[^>]->", "")
+    s = s:gsub("%[[%d%s/]+%]", "")
+    s = s:gsub("%(%s*%d+%s*/%s*%d+%s*%)", "")
+    s = s:gsub("^%s*[Dd][Ee][Ff][Ee][Aa][Tt]%s*", "")
+    s = s:gsub("^%(?%s*%d+%s*%)?%s*[xX]?%s*", "")
+    s = s:gsub("%s*%d+%s*/%s*%d+%s*$", "")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    local inner = s:match("^%((.+)%)$")
+    if inner then s = inner:gsub("^%s+", ""):gsub("%s+$", "") end
+    if s == "" then return nil end
+    return s
+end
+
+local function getQuestEnemyName()
+    local desc = hudGet(HUD.QuestDesc)
+    if not desc then return nil end
+    local ok, text = pcall(function() return desc.Text end)
+    if not ok then return nil end
+    return parseQuestDescription(text)
+end
+
+hasActiveQuest = function()
+    local quest = hudGet(HUD.Quest)
+    return quest ~= nil and quest:IsA("GuiObject") and quest.Visible == true
+end
+
+local function findQuestNPC()
+    local _, _, root = getCharacterParts()
+    local best, bestDist = nil, math.huge
+    for _, npc in ipairs(NPCS:GetChildren()) do
+        local head  = npc:FindFirstChild("Head")
+        local qmark = head and head:FindFirstChild("QMark")
+        if qmark and qmark:IsA("BillboardGui") and qmark.AlwaysOnTop then
+            local d = (root and head:IsA("BasePart")) and (head.Position - root.Position).Magnitude or 0
+            if d < bestDist then best, bestDist = npc, d end
+        end
+    end
+    return best
+end
+
+local function questArgFor(npcName)
+    return Config.QuestMap[npcName] or QUEST_NPC_MAP[npcName]
+end
+
+local function isGuiShown(obj)
+    local cur = obj
+    while cur and not cur:IsA("PlayerGui") do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return cur ~= nil
+end
+
+local function firstBasePart(npc, names)
+    for _, n in ipairs(names) do
+        local p = npc:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    return nil
+end
+
+local function npcRootPart(npc)
+    return firstBasePart(npc, {"HumanoidRootPart", "UpperTorso", "Torso", "Head"})
+end
+
+local function nearestQuestNPC(maxDist)
+    local _, _, root = getCharacterParts()
+    if not root then return nil end
+    local best, bestDist = nil, maxDist
+    for _, npc in ipairs(NPCS:GetChildren()) do
+        local head  = npc:FindFirstChild("Head")
+        local qmark = head and head:FindFirstChild("QMark")
+        if qmark and qmark:IsA("BillboardGui") then
+            local part = npcRootPart(npc)
+            if part then
+                local d = (part.Position - root.Position).Magnitude
+                if d <= bestDist then best, bestDist = npc, d end
+            end
+        end
+    end
+    return best
+end
+
+local function round2(x)
+    return math.floor(x * 100 + 0.5) / 100
+end
+
+local function learnStand(npc)
+    local _, _, root = getCharacterParts()
+    local part = npcRootPart(npc)
+    if not root or not part then return end
+    local off = root.Position - part.Position
+    if off.Magnitude > 20 then return end
+    local nx, ny, nz = round2(off.X), round2(off.Y), round2(off.Z)
+    local cur = Config.QuestStand[npc.Name]
+    if cur and math.abs(cur[1] - nx) < 0.5 and math.abs(cur[2] - ny) < 0.5 and math.abs(cur[3] - nz) < 0.5 then
+        return
+    end
+    Config.QuestStand[npc.Name] = {nx, ny, nz}
+    markDirty()
+    Hooks.Notify(("Posição de pegada aprendida para %s (%.1f studs do NPC)"):format(npc.Name, off.Magnitude))
+end
+
+local function onQuestArgCaptured(arg)
+    if not Runtime.Alive or not Config.LearnQuestArg then return end
+    if type(arg) ~= "string" or arg == "" then return end
+    local npc   = nearestQuestNPC(30)
+    local giver = npc and npc.Name or State.Giver
+    Hooks.Notify(("GetQuest observado: '%s' (NPC: %s)"):format(arg, giver or "?"))
+    if not giver then return end
+    if Config.QuestMap[giver] ~= arg then
+        Config.QuestMap[giver] = arg
+        markDirty()
+        Hooks.Notify(("Aprendi: %s -> %s"):format(giver, arg))
+    end
+end
+
+local function installQuestRemoteSpy()
+    if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
+        return false
+    end
+    local oldNamecall
+    local function hook(self, ...)
+        local method = getnamecallmethod()
+        if self == GetQuestEvent and (method == "InvokeServer" or method == "FireServer") then
+            local cap = genv.__AutoFarmHub_Capture
+            if cap and not (typeof(checkcaller) == "function" and checkcaller()) then
+                task.defer(cap, (...))
+            end
+        end
+        return oldNamecall(self, ...)
+    end
+    local wrapped = typeof(newcclosure) == "function" and newcclosure(hook) or hook
+    local ok = pcall(function()
+        oldNamecall = hookmetamethod(game, "__namecall", wrapped)
+    end)
+    return ok and oldNamecall ~= nil
+end
+
+genv.__AutoFarmHub_Capture = onQuestArgCaptured
+if Config.LearnQuestArg and not genv.__AutoFarmHub_SpyInstalled then
+    genv.__AutoFarmHub_SpyInstalled = installQuestRemoteSpy()
+end
+
+spawnLoop("giverwatch", function()
+    local active = hasActiveQuest()
+    if Config.LearnQuestArg then
+        if not active then
+            local npc = findQuestNPC()
+            State.Giver = npc and npc.Name or nil
+        elseif State.WasActive == false then
+            local npc = nearestQuestNPC(20)
+            if npc then learnStand(npc) end
+        end
+    end
+    State.WasActive = active
+end, CHECK)
+
+local function getQuestTouchPart(npc)
+    if Config.QuestTouchPart ~= "" then
+        local p = npc:FindFirstChild(Config.QuestTouchPart, true)
+        if p and p:IsA("BasePart") then return p end
+    end
+    for _, d in ipairs(npc:GetDescendants()) do
+        if d:IsA("BasePart") and d:FindFirstChildOfClass("TouchTransmitter") then
+            return d
+        end
+    end
+    return npcRootPart(npc)
+end
+
+local function approachQuestNPC(npc)
+    local touchPart = getQuestTouchPart(npc)
+    if not touchPart then
+        return false, "NPC de quest sem part alcançável"
+    end
+
+    Hooks.Status("Indo para dentro da part do NPC de quest...")
+    local goalCF = CFrame.new(touchPart.Position)
+    if not travelTo(goalCF) then
+        return false, "não consegui chegar no NPC de quest"
+    end
+
+    local _, _, root = getCharacterParts()
+    if root then
+        root.CFrame = goalCF
+        root.AssemblyLinearVelocity  = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        if typeof(firetouchinterest) == "function" then
+            pcall(function()
+                firetouchinterest(root, touchPart, 0)
+                task.wait()
+                firetouchinterest(root, touchPart, 1)
+            end)
+        end
+    end
+    return true
+end
+
+local function interactWithNPC(npc)
+    for _, d in ipairs(npc:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and typeof(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, d)
+            return
+        elseif d:IsA("ClickDetector") and typeof(fireclickdetector) == "function" then
+            pcall(fireclickdetector, d)
+            return
+        end
+    end
+    simulateClick()
+end
+
+local function clickGuiRect(obj)
+    local inset = GuiService:GetGuiInset()
+    local sg    = obj:FindFirstAncestorOfClass("ScreenGui")
+    if sg and sg.IgnoreGuiInset then
+        inset = Vector2.zero
+    end
+    sendClickAt(
+        math.floor(obj.AbsolutePosition.X + obj.AbsoluteSize.X / 2 + inset.X),
+        math.floor(obj.AbsolutePosition.Y + obj.AbsoluteSize.Y / 2 + inset.Y)
+    )
+end
+
+local function doDialogue(npc)
+    local t0             = os.clock()
+    local lastInteract   = 0
+    local clickedOption1 = false
+
+    while Runtime.Alive and os.clock() - t0 < DIALOGUE_TIMEOUT do
+        if hasActiveQuest() then
+            return true
+        end
+
+        local opt1 = hudGet(HUD.ChatOption1)
+        if opt1 and opt1:IsA("GuiButton") and isGuiShown(opt1) then
+            clickedOption1 = true
+            clickGuiRect(opt1)
+            task.wait(POLL)
+            continue
+        end
+
+        local chat = hudGet(HUD.Chat)
+        if chat and chat:IsA("GuiObject") and isGuiShown(chat) then
+            clickGuiRect(chat)
+        else
+            if clickedOption1 then
+                return true
+            end
+            if os.clock() - lastInteract >= 0.3 then
+                lastInteract = os.clock()
+                interactWithNPC(npc)
+            end
+        end
+
+        task.wait(POLL)
+    end
+
+    return hasActiveQuest()
+end
+
+local function waitQuest(timeout)
+    local t0 = os.clock()
+    while Runtime.Alive and os.clock() - t0 < timeout do
+        if hasActiveQuest() then return true end
+        task.wait(POLL)
+    end
+    return hasActiveQuest()
+end
+
+local function waitEnemyName(timeout)
+    local t0   = os.clock()
+    local name = getQuestEnemyName()
+    while Runtime.Alive and not name and os.clock() - t0 < timeout do
+        task.wait(POLL)
+        name = getQuestEnemyName()
+    end
+    return name
+end
+
+local function adoptActiveQuest(originCF)
+    local parsed = waitEnemyName(3)
+    local resolved
+    if parsed then
+        resolved = resolveLivingName(parsed) or parsed
+        State.AdoptedFor = parsed
+        if Config.NPCName ~= resolved then
+            Config.NPCName = resolved
+            Hooks.NPCName(resolved)
+            markDirty()
+        end
+        Hooks.Notify("Quest ativa! Alvo: " .. resolved)
+    else
+        State.AdoptedFor = "(desconhecido)"
+        Hooks.Notify("Quest ativa, mas não consegui ler o nome do inimigo. Farm ligado mesmo assim.")
+    end
+
+    if State.Enabled then
+        State.Target     = nil
+        State.EmptySince = nil
+    else
+        local ok = startFarm(originCF)
+        if not ok and not parsed then
+            return false, "não consegui ler o inimigo nem ligar o farm"
+        end
+    end
+    return true
+end
+
+local function tryGetQuest()
+    if hasActiveQuest() then return false, nil end
+    local npc = findQuestNPC()
+    if not npc then return false, nil end
+    local _, _, root = getCharacterParts()
+    if not root then return false, "personagem indisponível" end
+
+    local originCF = root.CFrame
+    State.QuestBusy = true
+    local ok, result, reason = pcall(function()
+        State.NeedNoclip = false
+        local arrived, why = approachQuestNPC(npc)
+        if not arrived then return false, why end
+        task.wait(POLL)
+
+        local arg = questArgFor(npc.Name)
+        local got = false
+
+        if arg and Config.PreferRemote then
+            Hooks.Status(("Pegando quest via remote (%s)..."):format(arg))
+            local callOk, res = callRemoteTimeout(GetQuestEvent, 5, arg)
+            if callOk and hasActiveQuest() then
+                got = true
+            elseif not callOk then
+                Hooks.Notify("Remote falhou: " .. tostring(res) .. " — usando diálogo.")
+            else
+                got = waitQuest(2)
+            end
+        end
+
+        if not got and Config.QuestUseDialogue then
+            Hooks.Status("Pegando quest pelo diálogo...")
+            doDialogue(npc)
+            got = waitQuest(3)
+        end
+
+        if not got and arg then
+            Hooks.Status("Tentando remote novamente (último recurso)...")
+            callRemoteTimeout(GetQuestEvent, 3, arg)
+            got = waitQuest(2)
+        end
+
+        if not got then
+            if arg then
+                return false, "não consegui pegar a quest (remote e diálogo falharam)"
+            end
+            return false, ("argumento do GetQuest desconhecido para %s e o diálogo não funcionou"):format(npc.Name)
+        end
+        return adoptActiveQuest(originCF)
+    end)
+    State.QuestBusy = false
+
+    if not ok then return false, tostring(result) end
+    return result, reason
+end
+
+spawnLoop("autoquest", function()
+    if not Config.AutoQuest or State.QuestBusy then return end
+
+    if hasActiveQuest() then
+        State.QuestFails = 0
+        local parsed = getQuestEnemyName()
+        if State.AdoptedFor == nil or (parsed and State.AdoptedFor ~= parsed) then
+            if parsed then
+                adoptActiveQuest()
+            elseif State.AdoptedFor == nil then
+                task.wait(0.5)
+                if hasActiveQuest() and State.AdoptedFor == nil then
+                    adoptActiveQuest()
+                end
+            end
+        end
+        return
+    end
+
+    State.AdoptedFor = nil
+    local ok, reason = tryGetQuest()
+    if ok then
+        State.QuestFails = 0
+    elseif reason then
+        State.QuestFails += 1
+        Hooks.Status("AutoQuest: " .. reason)
+        if State.QuestFails >= 3 then
+            State.QuestFails = 0
+            Config.AutoQuest = false
+            markDirty()
+            Hooks.QuestToggle(false)
+            Hooks.Notify("Auto Quest desligado após 3 falhas (" .. reason .. ").")
+        else
+            task.wait(Config.AutoQuestCooldown)
+        end
+    end
+end, POLL)
+
+spawnLoop("auto_option2", function()
+    if not hasActiveQuest() then return end
+    local opt2 = hudGet(HUD.ChatOption2)
+    if opt2 and opt2:IsA("GuiButton") and isGuiShown(opt2) then
+        clickGuiRect(opt2)
+        task.wait(0.15)
+    end
+end, POLL)
+
+local function pressKeyE()
+    pcall(function()
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+end
+
+local function getQueueOnTeleport()
+    return queue_on_teleport
+        or queueonteleport
+        or (syn and syn.queue_on_teleport)
+        or (fluxus and fluxus.queue_on_teleport)
+end
+
+local function queueAutoRaidReexec()
+    local q = getQueueOnTeleport()
+    if typeof(q) ~= "function" then return false end
+    local loader = [[
+        task.wait(2)
+        if typeof(isfile) == "function" and typeof(readfile) == "function" then
+            if isfile("AutoFarmHub.lua") then
+                loadstring(readfile("AutoFarmHub.lua"))()
+            elseif isfile("AutoFarmHub/AutoFarmHub.lua") then
+                loadstring(readfile("AutoFarmHub/AutoFarmHub.lua"))()
+            end
+        end
+    ]]
+    pcall(q, loader)
+    return true
+end
+
+keep(LP.OnTeleport:Connect(function(tpState)
+    if Config.AutoRaid and tpState == Enum.TeleportState.Started then
+        saveConfig(true)
+        queueAutoRaidReexec()
+    end
+end))
+
+local lastRaidTpAttempt = 0
+local raidPressedE = false
+spawnLoop("auto_raid", function()
+    if not Config.AutoRaid then return end
+
+    if game.PlaceId == NORMAL_PLACE_ID then
+        raidPressedE = false
+        local playBtn = hudGet(HUD.StartPlay)
+        if playBtn and playBtn:IsA("GuiButton") and isGuiShown(playBtn) then
+            Hooks.Status("Clicando em Play...")
+            clickGuiRect(playBtn)
+            task.wait(0.5)
+            return
+        end
+        if not Config.RaidName or Config.RaidName == "" or not Config.RaidDifficulty or Config.RaidDifficulty == "" then
+            return
+        end
+        if os.clock() - lastRaidTpAttempt < 5 then return end
+        lastRaidTpAttempt = os.clock()
+
+        saveConfig(true)
+        if not queueAutoRaidReexec() then
+            Hooks.Notify("Executor sem queue_on_teleport; coloque o script em autoexec.")
+        elseif typeof(isfile) == "function" and not isfile("AutoFarmHub.lua") and not isfile("AutoFarmHub/AutoFarmHub.lua") then
+            Hooks.Notify("Salve AutoFarmHub.lua na pasta workspace do executor para re-executar.")
+        end
+
+        local tpEvent = EventsFolder:FindFirstChild("TeleportToRaid")
+        if tpEvent and tpEvent:IsA("RemoteFunction") then
+            Hooks.Status(("Teleportando para %s (%s)..."):format(Config.RaidName, Config.RaidDifficulty))
+            pcall(function()
+                tpEvent:InvokeServer(Config.RaidName, Config.RaidDifficulty)
+            end)
+        end
+    else
+        if getCharacterParts() then
+            if not raidPressedE then
+                raidPressedE = true
+                pressKeyE()
+            end
+            if not State.Enabled then
+                startFarm()
+            end
+        end
+    end
+end, 0.5)
+
+spawnLoop("autosave", function()
+    if dirtyAt and os.clock() - dirtyAt > 1 then
+        dirtyAt = nil
+        saveConfig(true)
+    end
+end, 0.5)
+
+keep(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Keys.ToggleUI then
+        Runtime.ToggleUI()
+    elseif input.KeyCode == Keys.ToggleFarm then
+        if State.Enabled then stopFarm("manual", true) else startFarm() end
+    end
+end))
+
+------------------------------------------------------------------
+-- UI
+------------------------------------------------------------------
+local function buildUI()
+    local Theme = {
+        Bg     = Color3.fromRGB(16, 16, 22),
+        Panel  = Color3.fromRGB(24, 24, 32),
+        Card   = Color3.fromRGB(32, 32, 42),
+        Item   = Color3.fromRGB(44, 44, 58),
+        Off    = Color3.fromRGB(62, 62, 78),
+        Stroke = Color3.fromRGB(54, 54, 70),
+        Text   = Color3.fromRGB(235, 235, 245),
+        Sub    = Color3.fromRGB(150, 150, 172),
+        Accent = Color3.fromRGB(96, 132, 255),
+        Danger = Color3.fromRGB(190, 64, 64),
+    }
+
+    local function new(class, props, parent)
+        local o = Instance.new(class)
+        for k, v in pairs(props) do o[k] = v end
+        if parent then o.Parent = parent end
+        return o
+    end
+    local function round(o, r) return new("UICorner", {CornerRadius = UDim.new(0, r or 6)}, o) end
+    local function pad(o, l, t, r, b)
+        return new("UIPadding", {
+            PaddingLeft = UDim.new(0, l), PaddingTop = UDim.new(0, t),
+            PaddingRight = UDim.new(0, r), PaddingBottom = UDim.new(0, b),
+        }, o)
+    end
+
+    local orders = setmetatable({}, {__mode = "k"})
+    local function place(page, obj)
+        orders[page] = (orders[page] or 0) + 1
+        obj.LayoutOrder = orders[page]
+        obj.Parent = page
+        return obj
+    end
+
+    local function guiParent()
+        if typeof(gethui) == "function" then
+            local ok, h = pcall(gethui)
+            if ok and h then return h end
+        end
+        return game:GetService("CoreGui")
+    end
+
+    local old = guiParent():FindFirstChild("AutoFarmHub")
+    if old then old:Destroy() end
+
+    local gui = new("ScreenGui", {
+        Name = "AutoFarmHub", ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 50,
+    })
+    gui.Parent = guiParent()
+    Runtime.Gui = gui
+
+    local main = new("Frame", {
+        Name = "Main", Size = UDim2.fromOffset(560, 400),
+        Position = UDim2.new(0.5, -280, 0.5, -200),
+        BackgroundColor3 = Theme.Bg, BorderSizePixel = 0, Active = true, ClipsDescendants = true,
+    }, gui)
+    Runtime.MainFrame = main
+    round(main, 10)
+    new("UIStroke", {Color = Theme.Stroke, Thickness = 1}, main)
+    local scale = new("UIScale", {}, main)
+
+    local function fit()
+        local cam = workspace.CurrentCamera
+        local vp  = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        scale.Scale = math.clamp(math.min((vp.X - 24) / 560, (vp.Y - 24) / 400, 1), 0.5, 1)
+    end
+    fit()
+    if workspace.CurrentCamera then
+        keep(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fit))
+    end
+
+    local header = new("Frame", {Size = UDim2.new(1, 0, 0, 38), BackgroundColor3 = Theme.Panel, BorderSizePixel = 0}, main)
+    new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.new(0, 14, 0, 0), Size = UDim2.new(1, -90, 1, 0),
+        Text = "Auto Farm Hub  v5.4", Font = Enum.Font.GothamBold, TextSize = 14,
+        TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+
+    local function headerButton(text, xOffset, color)
+        local b = new("TextButton", {
+            Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, xOffset, 0.5, -11),
+            BackgroundColor3 = color, Text = text, TextColor3 = Theme.Text,
+            Font = Enum.Font.GothamBold, TextSize = 13, AutoButtonColor = true, BorderSizePixel = 0,
+        }, header)
+        round(b, 5)
+        return b
+    end
+    local btnMin   = headerButton("–", -62, Theme.Item)
+    local btnClose = headerButton("X", -32, Theme.Danger)
+
+    local sidebar = new("Frame", {
+        Position = UDim2.new(0, 0, 0, 38), Size = UDim2.new(0, 128, 1, -64),
+        BackgroundColor3 = Theme.Panel, BorderSizePixel = 0,
+    }, main)
+    new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, sidebar)
+    pad(sidebar, 8, 10, 8, 8)
+
+    local content = new("Frame", {
+        Position = UDim2.new(0, 128, 0, 38), Size = UDim2.new(1, -128, 1, -64), BackgroundTransparency = 1,
+    }, main)
+
+    local footer = new("Frame", {
+        Position = UDim2.new(0, 0, 1, -26), Size = UDim2.new(1, 0, 0, 26),
+        BackgroundColor3 = Theme.Panel, BorderSizePixel = 0,
+    }, main)
+    local statusLabel = new("TextLabel", {
+        BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(0.6, 0, 1, 0),
+        Text = "Status: Parado", Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = Theme.Sub,
+        TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+    }, footer)
+    new("TextLabel", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 0),
+        Size = UDim2.new(0.4, -12, 1, 0), Font = Enum.Font.Gotham, TextSize = 11, TextColor3 = Theme.Sub,
+        Text = "RShift: UI  |  F6: farm", TextXAlignment = Enum.TextXAlignment.Right,
+    }, footer)
+
+    local lastStatus
+    Hooks.Status = function(text)
+        if text ~= lastStatus then
+            lastStatus = text
+            statusLabel.Text = "Status: " .. text
+        end
+    end
+
+    local toastHolder = new("Frame", {
+        BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -12, 0, 12), Size = UDim2.new(0, 280, 1, -24),
+    }, gui)
+    new("UIListLayout", {
+        Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    }, toastHolder)
+    local toastCount = 0
+    Hooks.Notify = function(msg)
+        print("[AutoFarmHub] " .. tostring(msg))
+        toastCount += 1
+        local t = new("TextLabel", {
+            LayoutOrder = toastCount, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = Theme.Panel, BorderSizePixel = 0, TextWrapped = true,
+            Text = tostring(msg), Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, toastHolder)
+        round(t, 6)
+        pad(t, 10, 8, 10, 8)
+        new("UIStroke", {Color = Theme.Accent, Thickness = 1, Transparency = 0.4}, t)
+        task.delay(3.5, function() t:Destroy() end)
+    end
+
+    local pages, tabButtons = {}, {}
+    local function selectTab(name)
+        for n, p in pairs(pages) do p.Visible = (n == name) end
+        for n, b in pairs(tabButtons) do
+            local on = (n == name)
+            b.BackgroundColor3 = on and Theme.Accent or Theme.Panel
+            b.TextColor3 = on and Color3.new(1, 1, 1) or Theme.Sub
+        end
+    end
+
+    local function addTab(name, order)
+        local btn = new("TextButton", {
+            LayoutOrder = order, Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = Theme.Panel,
+            AutoButtonColor = false, BorderSizePixel = 0, Text = name,
+            Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = Theme.Sub,
+        }, sidebar)
+        round(btn, 6)
+        local page = new("ScrollingFrame", {
+            Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+            ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Off, CanvasSize = UDim2.new(),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+            Visible = false,
+        }, content)
+        new("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, page)
+        pad(page, 10, 10, 12, 10)
+        pages[name], tabButtons[name] = page, btn
+        btn.MouseButton1Click:Connect(function() selectTab(name) end)
+        return page
+    end
+
+    local function addSection(page, text)
+        place(page, new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 18), BackgroundTransparency = 1, Text = string.upper(text),
+            Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Theme.Accent,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }))
+    end
+
+    local function addInfo(page, text)
+        place(page, new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+            TextWrapped = true, Text = text, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Sub,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+        }))
+    end
+
+    local function addButton(page, text, onClick, color)
+        local b = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = color or Theme.Item, BorderSizePixel = 0,
+            Text = text, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = Theme.Text,
+        })
+        round(b, 6)
+        place(page, b)
+        b.MouseButton1Click:Connect(onClick)
+        return b
+    end
+
+    local function addToggle(page, text, initial, onChange)
+        local row = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Card, BorderSizePixel = 0,
+            Text = "", AutoButtonColor = false,
+        })
+        round(row, 6)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -70, 1, 0),
+            Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local pill = new("Frame", {
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+            Size = UDim2.fromOffset(38, 20), BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+        }, row)
+        round(pill, 10)
+        local knob = new("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0),
+            Size = UDim2.fromOffset(16, 16), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+        }, pill)
+        round(knob, 8)
+        place(page, row)
+
+        local state = initial and true or false
+        local function render(animate)
+            local goalPos = state and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0)
+            local goalCol = state and Theme.Accent or Theme.Off
+            if animate then
+                local info = TweenInfo.new(0.12)
+                TweenService:Create(knob, info, {Position = goalPos}):Play()
+                TweenService:Create(pill, info, {BackgroundColor3 = goalCol}):Play()
+            else
+                knob.Position, pill.BackgroundColor3 = goalPos, goalCol
+            end
+        end
+        render(false)
+        local function set(v, silent)
+            state = v and true or false
+            render(true)
+            if not silent then
+                if onChange then onChange(state) end
+                markDirty()
+            end
+        end
+        row.MouseButton1Click:Connect(function() set(not state) end)
+        return set
+    end
+
+    local function addSlider(page, text, min, max, step, initial, fmt, onChange)
+        local row = new("Frame", {Size = UDim2.new(1, 0, 0, 52), BackgroundColor3 = Theme.Card, BorderSizePixel = 0})
+        round(row, 6)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 6), Size = UDim2.new(1, -90, 0, 18),
+            Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local valueLabel = new("TextLabel", {
+            BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 6),
+            Size = UDim2.fromOffset(70, 18), Font = Enum.Font.GothamBold, TextSize = 12,
+            TextColor3 = Theme.Accent, TextXAlignment = Enum.TextXAlignment.Right,
+        }, row)
+        local bar = new("TextButton", {
+            Position = UDim2.new(0, 12, 0, 34), Size = UDim2.new(1, -24, 0, 8), BackgroundColor3 = Theme.Off,
+            BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+        }, row)
+        round(bar, 4)
+        local fill = new("Frame", {Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Theme.Accent, BorderSizePixel = 0}, bar)
+        round(fill, 4)
+        place(page, row)
+
+        local value = initial
+        local function setValue(v, silent)
+            v = math.clamp(v, min, max)
+            if step and step > 0 then
+                v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+            end
+            value = v
+            fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+            valueLabel.Text = fmt(v)
+            if not silent then
+                if onChange then onChange(v) end
+                markDirty()
+            end
+        end
+        setValue(initial, true)
+
+        local dragging = false
+        local function fromInput(input)
+            local rel = math.clamp((input.Position.X - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
+            setValue(min + rel * (max - min))
+        end
+        bar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                fromInput(input)
+            end
+        end)
+        keep(UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                fromInput(input)
+            end
+        end))
+        keep(UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end))
+    end
+
+    local function addSegmented(page, text, options, initial, onChange)
+        local row = new("Frame", {Size = UDim2.new(1, 0, 0, 58), BackgroundColor3 = Theme.Card, BorderSizePixel = 0})
+        round(row, 6)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 4), Size = UDim2.new(1, -24, 0, 18),
+            Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local holder = new("Frame", {
+            Position = UDim2.new(0, 12, 0, 26), Size = UDim2.new(1, -24, 0, 24), BackgroundTransparency = 1,
+        }, row)
+        new("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, holder)
+        place(page, row)
+
+        local n, current, buttons = #options, initial, {}
+        local function render()
+            for v, b in pairs(buttons) do
+                local on = (v == current)
+                b.BackgroundColor3 = on and Theme.Accent or Theme.Item
+                b.TextColor3 = on and Color3.new(1, 1, 1) or Theme.Sub
+            end
+        end
+        for i, v in ipairs(options) do
+            local b = new("TextButton", {
+                LayoutOrder = i, Size = UDim2.new(1 / n, -4 * (n - 1) / n, 1, 0), AutoButtonColor = false,
+                BorderSizePixel = 0, Text = v, Font = Enum.Font.GothamMedium, TextSize = 12,
+            }, holder)
+            round(b, 5)
+            buttons[v] = b
+            b.MouseButton1Click:Connect(function()
+                current = v
+                render()
+                onChange(v)
+                markDirty()
+            end)
+        end
+        render()
+    end
+
+    local function addNumberBox(page, text, initial, onCommit)
+        local row = new("Frame", {Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Card, BorderSizePixel = 0})
+        round(row, 6)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -100, 1, 0),
+            Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local box = new("TextBox", {
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(70, 22),
+            BackgroundColor3 = Theme.Item, BorderSizePixel = 0, Text = tostring(initial), ClearTextOnFocus = false,
+            Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text,
+        }, row)
+        round(box, 5)
+        place(page, row)
+        local current = initial
+        box.FocusLost:Connect(function()
+            local n = tonumber(box.Text)
+            if n then current = onCommit(n); markDirty() end
+            box.Text = tostring(current)
+        end)
+    end
+
+    local function addTextBox(page, text, initial, onCommit)
+        local row = new("Frame", {Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Card, BorderSizePixel = 0})
+        round(row, 6)
+        new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -170, 1, 0),
+            Text = text, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local box = new("TextBox", {
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(140, 22),
+            BackgroundColor3 = Theme.Item, BorderSizePixel = 0, Text = initial or "", PlaceholderText = "automático",
+            PlaceholderColor3 = Theme.Sub, ClearTextOnFocus = false, Font = Enum.Font.GothamBold, TextSize = 12,
+            TextColor3 = Theme.Text,
+        }, row)
+        round(box, 5)
+        place(page, row)
+        box.FocusLost:Connect(function()
+            onCommit(box.Text)
+            markDirty()
+        end)
+    end
+
+    local function addDropdown(page, text, getOptions, onSelect, initial)
+        local holder = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+        })
+        new("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, holder)
+        place(page, holder)
+
+        local head = new("TextButton", {
+            LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.Card, BorderSizePixel = 0,
+            Text = "", AutoButtonColor = false,
+        }, holder)
+        round(head, 6)
+        local label = new("TextLabel", {
+            BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -40, 1, 0),
+            Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.Text, Text = "",
+            TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+        }, head)
+        local arrow = new("TextLabel", {
+            BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 0),
+            Size = UDim2.fromOffset(18, 34), Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Theme.Sub,
+            Text = "▼",
+        }, head)
+
+        local list = new("ScrollingFrame", {
+            LayoutOrder = 2, Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = Theme.Card, BorderSizePixel = 0,
+            ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            Visible = false,
+        }, holder)
+        round(list, 6)
+        new("UIListLayout", {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder}, list)
+        pad(list, 4, 4, 4, 4)
+
+        local selected = initial
+        local function renderHead() label.Text = text .. ": " .. (selected or "—") end
+        renderHead()
+
+        local function close() list.Visible = false; arrow.Text = "▼" end
+
+        local function rebuild()
+            for _, c in ipairs(list:GetChildren()) do
+                if c:IsA("GuiObject") then c:Destroy() end
+            end
+            local opts = getOptions()
+            if #opts == 0 then
+                new("TextLabel", {
+                    Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, Text = "Nenhum NPC encontrado em Living",
+                    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Sub,
+                }, list)
+            end
+            for i, opt in ipairs(opts) do
+                local b = new("TextButton", {
+                    LayoutOrder = i, Size = UDim2.new(1, -6, 0, 26),
+                    BackgroundColor3 = (opt.value == selected) and Theme.Accent or Theme.Item,
+                    BorderSizePixel = 0, AutoButtonColor = true, Text = opt.text,
+                    Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = Theme.Text,
+                }, list)
+                round(b, 4)
+                b.MouseButton1Click:Connect(function()
+                    selected = opt.value
+                    renderHead()
+                    close()
+                    onSelect(opt.value)
+                    markDirty()
+                end)
+            end
+            list.Size = UDim2.new(1, 0, 0, math.clamp(math.max(#opts, 1) * 28 + 8, 36, 160))
+        end
+
+        head.MouseButton1Click:Connect(function()
+            if list.Visible then close()
+            else rebuild(); list.Visible = true; arrow.Text = "▲" end
+        end)
+
+        return {setSelected = function(v) selected = v; renderHead() end}
+    end
+
+    local function f0(v) return ("%.0f"):format(v) end
+    local function f1(v) return ("%.1f"):format(v) end
+    local function f2(v) return ("%.2f"):format(v) end
+    local function fs0(v) return v <= 0 and "off" or ("%.0f s"):format(v) end
+
+    local farmPage = addTab("Farm", 1)
+    addSection(farmPage, "Controle")
+    local farmSet = addToggle(farmPage, "Auto Farm", false, function(v)
+        if v then startFarm() else stopFarm("manual", true) end
+    end)
+    Hooks.FarmToggle = function(v) farmSet(v, true) end
+
+    addSection(farmPage, "Alvo")
+    local dd = addDropdown(farmPage, "Grupo de NPC", function()
+        local out = {}
+        for _, e in ipairs(listNPCNames()) do
+            table.insert(out, {value = e.name, text = ("%s  (%d)"):format(e.name, e.count)})
+        end
+        return out
+    end, function(value)
+        Config.NPCName = value
+        State.Target = nil
+    end, Config.NPCName)
+    Hooks.NPCName = function(n) dd.setSelected(n) end
+
+    addSegmented(farmPage, "Posição em relação ao NPC", {"Cima", "Baixo", "Atrás"}, Config.Mode, function(v)
+        Config.Mode = v
+    end)
+
+    addSection(farmPage, "Movimento")
+    addSlider(farmPage, "Distância (studs)", 1, 20, 1, Config.Distance, f0, function(v) Config.Distance = v end)
+    addSlider(farmPage, "Velocidade de viagem (studs/s)", 30, 500, 10, Config.TravelSpeed, f0, function(v) Config.TravelSpeed = v end)
+    addSlider(farmPage, "Raio do snap (studs)", 1, 15, 1, Config.SnapRadius, f0, function(v) Config.SnapRadius = v end)
+    addToggle(farmPage, "Noclip o tempo todo", Config.Noclip, function(v) Config.Noclip = v end)
+
+    addSection(farmPage, "Robustez")
+    addSlider(farmPage, "Esperar respawn antes de parar", 0, 30, 1, Config.RespawnWait, fs0, function(v) Config.RespawnWait = v end)
+    addSlider(farmPage, "Pular alvo travado após", 0, 120, 5, Config.TargetTimeout, fs0, function(v) Config.TargetTimeout = v end)
+
+    local combatPage = addTab("Combate", 2)
+    addSection(combatPage, "Auto Attack")
+    addToggle(combatPage, "Auto Attack", Config.AutoAttack, function(v) Config.AutoAttack = v end)
+    addSlider(combatPage, "Intervalo do ataque (s)", 0.05, 0.5, 0.01, Config.AttackSpeed, f2, function(v) Config.AttackSpeed = v end)
+    addSlider(combatPage, "Distância máx. para atacar", 4, 40, 1, Config.AttackMaxDistance, f0, function(v) Config.AttackMaxDistance = v end)
+    addSlider(combatPage, "Offset do hit (remote)", 0, 5, 0.1, Config.AttackOffset, f1, function(v) Config.AttackOffset = v end)
+
+    addSection(combatPage, "Método")
+    addToggle(combatPage, "Click simulado (centro da tela)", Config.UseClickSim, function(v) Config.UseClickSim = v end)
+    addToggle(combatPage, "Remote Combat (FireServer)", Config.UseRemote, function(v) Config.UseRemote = v end)
+    addNumberBox(combatPage, "Tipo de ataque (remote)", Config.AttackType, function(n)
+        Config.AttackType = math.floor(n)
+        return Config.AttackType
+    end)
+    addInfo(combatPage, "O ataque só dispara com o Auto Farm ligado e um alvo vivo dentro da distância máxima.")
+
+    addSection(combatPage, "Auto Dodge")
+    addToggle(combatPage, "Auto Dodge (Animações de Skill)", Config.AutoDodge, function(v)
+        Config.AutoDodge = v
+        if not v then clearDodgeWatch() end
+    end)
+    addSlider(combatPage, "Distância do dodge (studs)", 5, 50, 1, Config.DodgeDistance, f0, function(v) Config.DodgeDistance = v end)
+    addSlider(combatPage, "Velocidade do dodge (mult.)", 1.1, 3.0, 0.1, Config.DodgeSpeedMult, f1, function(v) Config.DodgeSpeedMult = v end)
+    addSlider(combatPage, "Duração do dodge (s)", 0.2, 2.5, 0.1, Config.DodgeHold, f1, function(v) Config.DodgeHold = v end)
+
+    local raidPage = addTab("Raid", 3)
+    addSection(raidPage, "Auto Raid")
+    addToggle(raidPage, "Auto Raid", Config.AutoRaid, function(v)
+        Config.AutoRaid = v
+        if not v and isRaidFarmActive() == false and game.PlaceId ~= NORMAL_PLACE_ID and State.Enabled then
+            stopFarm("manual", false)
+        end
+    end)
+
+    addSection(raidPage, "Seleção")
+    local raidDiffDropdown
+    addDropdown(raidPage, "Raid", function()
+        local out = {}
+        for _, name in ipairs(RAID_LIST) do
+            table.insert(out, {value = name, text = name})
+        end
+        return out
+    end, function(value)
+        Config.RaidName = value
+        if raidDiffDropdown and raidDiffDropdown.setVisible then
+            raidDiffDropdown.setVisible(true)
+        end
+    end, Config.RaidName)
+
+    raidDiffDropdown = addDropdown(raidPage, "Dificuldade", function()
+        local out = {}
+        for _, diff in ipairs(RAID_DIFFICULTIES) do
+            table.insert(out, {value = diff, text = diff})
+        end
+        return out
+    end, function(value)
+        Config.RaidDifficulty = value
+    end, Config.RaidDifficulty)
+
+    addInfo(raidPage, "Na place normal (4934471106), o Auto Raid teleporta para a raid selecionada. Dentro da raid, ele farma todos os NPCs de Living usando as configs de Farm/Combate/Dodge e re-executa ao voltar.")
+
+    local questPage = addTab("Quest", 4)
+    addSection(questPage, "Auto Get Quest")
+    local questSet = addToggle(questPage, "Auto Get Quest", Config.AutoQuest, function(v)
+        Config.AutoQuest = v
+        State.AdoptedFor = nil
+        State.QuestFails = 0
+    end)
+    Hooks.QuestToggle = function(v) questSet(v, true) end
+    addSlider(questPage, "Espera após tentativa que falhou (s)", 0.2, 15, 0.1, Config.AutoQuestCooldown, f1, function(v) Config.AutoQuestCooldown = v end)
+
+    addSection(questPage, "Como pegar")
+    addToggle(questPage, "Preferir remote (se o argumento é conhecido)", Config.PreferRemote, function(v) Config.PreferRemote = v end)
+    addToggle(questPage, "Usar diálogo (prompt/clique) quando precisar", Config.QuestUseDialogue, function(v) Config.QuestUseDialogue = v end)
+    addToggle(questPage, "Aprender quests (argumento e posição)", Config.LearnQuestArg, function(v) Config.LearnQuestArg = v end)
+    addTextBox(questPage, "Part de toque (opcional)", Config.QuestTouchPart, function(s) Config.QuestTouchPart = s end)
+    addInfo(questPage, genv.__AutoFarmHub_SpyInstalled
+        and "Hook do GetQuest: ativo (aprende o argumento quando o diálogo do jogo chama o remote)."
+        or "Hook do GetQuest: inativo ou indisponível neste executor. Argumentos vêm de QUEST_NPC_MAP; a posição de pegada ainda é aprendida.")
+
+    addSection(questPage, "Ações")
+    addButton(questPage, "Pegar / adotar quest agora", function()
+        if State.QuestBusy then
+            Hooks.Notify("Já tem uma quest em andamento.")
+            return
+        end
+        task.spawn(function()
+            if hasActiveQuest() then
+                local ok, why = adoptActiveQuest()
+                if not ok then Hooks.Notify(why) end
+                return
+            end
+            local ok, reason = tryGetQuest()
+            if not ok then Hooks.Notify("Nada feito: " .. (reason or "nenhum NPC de quest com QMark")) end
+        end)
+    end)
+    addButton(questPage, "Listar quests conhecidas", function()
+        local lines, seen = {}, {}
+        for npcName, arg in pairs(Config.QuestMap) do
+            seen[npcName] = true
+            table.insert(lines, npcName .. " -> " .. arg .. " (aprendido)")
+        end
+        for npcName, arg in pairs(QUEST_NPC_MAP) do
+            if not seen[npcName] then table.insert(lines, npcName .. " -> " .. arg) end
+        end
+        for npcName in pairs(Config.QuestStand) do
+            table.insert(lines, npcName .. ": posição de pegada aprendida")
+        end
+        table.sort(lines)
+        Hooks.Notify(#lines > 0 and table.concat(lines, "\n") or "Nenhuma quest conhecida ainda.")
+    end)
+    addButton(questPage, "Inspecionar quest e NPC (ver output F9)", function()
+        local qf = hudGet(HUD.Quest)
+        if qf then
+            print("[AutoFarmHub] Textos no HUD de quest:")
+            for _, d in ipairs(qf:GetDescendants()) do
+                if d:IsA("TextLabel") or d:IsA("TextButton") then
+                    print("  " .. d:GetFullName() .. " = " .. tostring(d.Text))
+                end
+            end
+        end
+        local npc = findQuestNPC() or nearestQuestNPC(40)
+        if not npc then
+            Hooks.Notify("Nenhum NPC de quest encontrado perto/com QMark AlwaysOnTop.")
+            return
+        end
+        local _, _, root = getCharacterParts()
+        print("[AutoFarmHub] NPC de quest: " .. npc:GetFullName())
+        for _, d in ipairs(npc:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local dist = root and (d.Position - root.Position).Magnitude or -1
+                print(("  Part %s | %s | CanTouch=%s | Touch=%s | dist=%.1f"):format(
+                    d:GetFullName(), d.ClassName, tostring(d.CanTouch),
+                    tostring(d:FindFirstChildOfClass("TouchTransmitter") ~= nil), dist))
+            elseif d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+                print("  " .. d.ClassName .. " " .. d:GetFullName())
+            end
+        end
+        Hooks.Notify("Detalhes impressos no output (F9).")
+    end)
+    addInfo(questPage, "Se já houver quest ativa, o script lê o inimigo no TextLabel e liga o farm. Se não houver, viaja até a part do NPC e pega por remote ou pelo diálogo.")
+
+    local cfgPage = addTab("Config", 5)
+    addSection(cfgPage, "Configuração")
+    addButton(cfgPage, "Salvar config", saveConfig)
+    addInfo(cfgPage, "Tudo é salvo automaticamente 1s depois de qualquer mudança (inclui NPC escolhido, toggles e quests aprendidas) e carregado ao iniciar. Precisa de writefile/readfile no executor.")
+    addSection(cfgPage, "Script")
+    addButton(cfgPage, "Descarregar script", cleanup, Theme.Danger)
+    addInfo(cfgPage, "Atalhos: RightShift mostra/oculta a janela, F6 liga/desliga o farm (edite a tabela Keys no topo).")
+
+    selectTab("Farm")
+
+    local dragging, dragStart, startPos = false, nil, nil
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, main.Position
+        end
+    end)
+    keep(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = (input.Position - dragStart) / scale.Scale
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    keep(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+
+    local minimized = false
+    btnMin.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        sidebar.Visible, content.Visible, footer.Visible = not minimized, not minimized, not minimized
+        main.Size = minimized and UDim2.fromOffset(560, 38) or UDim2.fromOffset(560, 400)
+        btnMin.Text = minimized and "+" or "–"
+    end)
+    btnClose.MouseButton1Click:Connect(cleanup)
+
+    Runtime.ToggleUI = function() main.Visible = not main.Visible end
+end
+
+buildUI()
+Hooks.Notify("Auto Farm Hub v5.4 carregado. RightShift oculta/mostra a janela.")
+if Config.LearnQuestArg and not genv.__AutoFarmHub_SpyInstalled then
+    Hooks.Notify("Hook do GetQuest indisponível neste executor: preencha QUEST_NPC_MAP à mão.")
+end
